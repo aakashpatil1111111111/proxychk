@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 # ── Telegram ──────────────────────────────────────────────────────────────
-BOT_TOKEN = "8871497353:AAGgydLe71aNb07kuWZoOUaW0wbRrC2d9Ow"
+BOT_TOKEN = "8871497353:AAF8EHmP7roz6Y0qJZE-JBH6x0fftPVWAhE"
 ADMIN_USER_ID = 5010778910
 GROUP_IDS = [-1004358364327]
 ALLOWED_USER_IDS = []
