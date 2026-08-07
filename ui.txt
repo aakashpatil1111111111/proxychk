@@ -1,0 +1,424 @@
+"""All user-facing text and keyboards live here.
+
+One consistent visual language:
+  ▰▱  progress / share bars      ━  section rules
+  ▸    list markers              ·   inline separators
+"""
+
+import html
+from typing import Dict, List, Sequence
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+import checker
+from checker import KIND_DATACENTER, KIND_MOBILE, KIND_RESIDENTIAL, KIND_UNKNOWN
+
+RULE = "━━━━━━━━━━━━━━━━━━━━"
+ALIVE_PER_PAGE = 8
+DEAD_PER_PAGE = 12
+
+
+def esc(value) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def bar(pct: float, width: int = 10) -> str:
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(width, filled))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def num(value) -> str:
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def human_time(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+def user_tag(user) -> str:
+    if user is None:
+        return "unknown"
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    return esc(getattr(user, "first_name", None) or getattr(user, "id", "user"))
+
+
+# ── static screens ────────────────────────────────────────────────────────
+START_TEXT = (
+    "⚡ <b>PROXY LAB</b>\n"
+    f"{RULE}\n"
+    "High-speed proxy validation with live geo, ISP, rotation and anonymity "
+    "detection.\n\n"
+    "▸ Paste proxies (one per line) or drop a <b>.txt</b> file\n"
+    "▸ Every format is understood — auto-detected\n"
+    "▸ Results split into <b>Alive · Rotating · Dead</b>\n"
+    "▸ Export as TXT pack or full CSV\n\n"
+    "<i>Send your list whenever you're ready.</i>"
+)
+
+FORMATS_TEXT = (
+    "🧾 <b>SUPPORTED FORMATS</b>\n"
+    f"{RULE}\n"
+    "<code>ip:port</code>\n"
+    "<code>ip:port:user:pass</code>\n"
+    "<code>user:pass:ip:port</code>\n"
+    "<code>socks5://ip:port</code>\n"
+    "<code>socks5://user:pass@ip:port</code>\n"
+    "<code>socks4://ip:port</code>\n"
+    "<code>http://ip:port</code>\n"
+    "<code>ip port user pass</code>  <i>(spaces or |)</i>\n\n"
+    "▸ Scheme missing? It's guessed from the port.\n"
+    "▸ Duplicates are removed automatically.\n"
+    "▸ Files: <code>.txt .csv .log .list</code>"
+)
+
+HELP_TEXT = (
+    "🛟 <b>HELP</b>\n"
+    f"{RULE}\n"
+    "<b>How it works</b>\n"
+    "1. Send proxies as text or a .txt file\n"
+    "2. Live progress while every proxy is tested twice\n"
+    "3. Browse results by category, then export\n\n"
+    "<b>What is detected</b>\n"
+    "✅ Alive · ❌ Dead · 🔄 Rotating exit IP\n"
+    "🌍 Country / city · 📡 ISP · ⚡ Latency\n"
+    "🏠 Residential · 🏢 Datacenter · 📶 Mobile\n"
+    "🔒 Anonymous vs 👁 Transparent\n\n"
+    "<b>Commands</b>\n"
+    "<code>/start</code> — main menu\n"
+    "<code>/stats</code> — your usage stats\n"
+    "<code>/formats</code> — accepted formats\n"
+    "<code>/cancel</code> — stop a running scan\n"
+    "<code>/help</code> — this screen"
+)
+
+
+def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("🚀 Start a scan", callback_data="menu:new"),
+            InlineKeyboardButton("🧾 Formats", callback_data="menu:formats"),
+        ],
+        [
+            InlineKeyboardButton("📈 My stats", callback_data="menu:stats"),
+            InlineKeyboardButton("🛟 Help", callback_data="menu:help"),
+        ],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton("👑 Admin centre", callback_data="admin:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def back_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menu", callback_data="menu:home")]])
+
+
+def progress_text(done: int, total: int, elapsed: float, concurrency: int) -> str:
+    pct = (done / total * 100) if total else 0
+    eta = ""
+    if done and done < total:
+        rate = done / max(elapsed, 0.001)
+        remaining = (total - done) / rate if rate else 0
+        eta = f" · ETA {human_time(remaining)}"
+    return (
+        "🛰 <b>SCANNING</b>\n"
+        f"{RULE}\n"
+        f"<code>{bar(pct, 14)}</code>  <b>{pct:.0f}%</b>\n\n"
+        f"▸ Tested: <b>{num(done)}</b> / {num(total)}\n"
+        f"▸ Elapsed: {human_time(elapsed)}{eta}\n"
+        f"▸ Threads: {concurrency}\n\n"
+        "<i>You can keep using the bot — this runs in the background.</i>"
+    )
+
+
+def progress_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel scan", callback_data="scan:cancel")]])
+
+
+# ── result screens ────────────────────────────────────────────────────────
+def _kind_counts(results) -> Dict[str, int]:
+    counts = {KIND_RESIDENTIAL: 0, KIND_DATACENTER: 0, KIND_MOBILE: 0, KIND_UNKNOWN: 0}
+    for r in results:
+        counts[r.kind if r.kind in counts else KIND_UNKNOWN] += 1
+    return counts
+
+
+def summary_text(results, total_parsed: int, truncated: bool, elapsed: float, limit: int) -> str:
+    alive = [r for r in results if r.alive]
+    dead = [r for r in results if not r.alive]
+    rotating = [r for r in alive if r.rotating]
+    total = len(results) or 1
+    alive_pct = len(alive) / total * 100
+    kinds = _kind_counts(alive)
+    lines = [
+        "✅ <b>SCAN COMPLETE</b>" if alive else "📕 <b>SCAN COMPLETE</b>",
+        RULE,
+        f"<b>{num(len(results))}</b> proxies tested in {human_time(elapsed)}",
+        "",
+        f"✅ Alive     <b>{num(len(alive))}</b>",
+        f"<code>{bar(alive_pct)}</code> {alive_pct:.0f}% success",
+        f"🔄 Rotating  <b>{num(len(rotating))}</b>",
+        f"❌ Dead      <b>{num(len(dead))}</b>",
+    ]
+    if alive:
+        latencies = [r.latency for r in alive if r.latency]
+        if latencies:
+            lines += [
+                "",
+                f"⚡ Avg <b>{int(sum(latencies) / len(latencies))}ms</b> · "
+                f"Fastest <b>{min(latencies)}ms</b>",
+            ]
+        lines.append(
+            f"🏠 {kinds[KIND_RESIDENTIAL]} · 🏢 {kinds[KIND_DATACENTER]} · "
+            f"📶 {kinds[KIND_MOBILE]} · ❓ {kinds[KIND_UNKNOWN]}"
+        )
+        top = country_counts(alive)[:4]
+        if top:
+            lines.append(
+                "🌍 " + " · ".join(f"{checker.flag(cc)} {esc(cc or '??')} {n}" for cc, n in top)
+            )
+    if truncated:
+        lines += ["", f"<i>⚠ Only the first {num(limit)} proxies were checked.</i>"]
+    lines += ["", "<i>Tap a category below to inspect the results.</i>"]
+    return "\n".join(lines)
+
+
+def summary_kb(results) -> InlineKeyboardMarkup:
+    alive = [r for r in results if r.alive]
+    dead = [r for r in results if not r.alive]
+    rotating = [r for r in alive if r.rotating]
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(f"✅ Alive · {len(alive)}", callback_data="v:alive:0"),
+                InlineKeyboardButton(f"🔄 Rotating · {len(rotating)}", callback_data="v:rot:0"),
+            ],
+            [
+                InlineKeyboardButton(f"❌ Dead · {len(dead)}", callback_data="v:dead:0"),
+                InlineKeyboardButton("🌍 Countries", callback_data="v:geo:0"),
+            ],
+            [
+                InlineKeyboardButton("⚡ Speed", callback_data="v:speed:0"),
+                InlineKeyboardButton("🧬 Types", callback_data="v:kind:0"),
+            ],
+            [
+                InlineKeyboardButton("📥 TXT pack", callback_data="dl:txt"),
+                InlineKeyboardButton("📊 CSV", callback_data="dl:csv"),
+            ],
+            [InlineKeyboardButton("🔁 New scan", callback_data="menu:new")],
+        ]
+    )
+
+
+def _pager(view: str, page: int, pages: int) -> List[InlineKeyboardButton]:
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️", callback_data=f"v:{view}:{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton("➡️", callback_data=f"v:{view}:{page + 1}"))
+    return row
+
+
+def detail_kb(view: str, page: int, pages: int, download: str = "") -> InlineKeyboardMarkup:
+    rows = []
+    if pages > 1:
+        rows.append(_pager(view, page, pages))
+    if download:
+        rows.append([InlineKeyboardButton("📥 Download this list", callback_data=f"dl:{download}")])
+    rows.append([InlineKeyboardButton("⬅️ Summary", callback_data="v:sum:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def alive_page(results, page: int, only_rotating: bool = False) -> str:
+    items = [r for r in results if r.alive and (r.rotating or not only_rotating)]
+    title = "🔄 <b>ROTATING PROXIES</b>" if only_rotating else "✅ <b>ALIVE PROXIES</b>"
+    if not items:
+        return f"{title}\n{RULE}\nNothing in this category."
+    pages = max(1, (len(items) + ALIVE_PER_PAGE - 1) // ALIVE_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * ALIVE_PER_PAGE : (page + 1) * ALIVE_PER_PAGE]
+    lines = [f"{title} · {num(len(items))}", RULE]
+    start = page * ALIVE_PER_PAGE + 1
+    for i, r in enumerate(chunk, start):
+        loc = " ".join(
+            x for x in [checker.flag(r.country_code), esc(r.country or "Unknown"), esc(r.city)] if x
+        )
+        tags = [f"⚡ {r.latency}ms" if r.latency else "", r.kind_label]
+        if r.rotating:
+            tags.append("🔄 Rotating")
+        tags.append("🔒 Anonymous" if r.anonymous else "👁 Transparent")
+        lines.append(f"<b>{i}.</b> <code>{esc(r.entry.display())}</code>")
+        lines.append(f"     ↳ {loc}")
+        if r.isp:
+            lines.append(f"     ↳ 📡 {esc(r.isp[:44])}")
+        lines.append(f"     ↳ {' · '.join(t for t in tags if t)}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def dead_page(results, page: int) -> str:
+    items = [r for r in results if not r.alive]
+    if not items:
+        return f"❌ <b>DEAD PROXIES</b>\n{RULE}\nNothing dead — perfect batch."
+    pages = max(1, (len(items) + DEAD_PER_PAGE - 1) // DEAD_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * DEAD_PER_PAGE : (page + 1) * DEAD_PER_PAGE]
+    lines = [f"❌ <b>DEAD PROXIES</b> · {num(len(items))}", RULE]
+    start = page * DEAD_PER_PAGE + 1
+    for i, r in enumerate(chunk, start):
+        lines.append(f"<b>{i}.</b> <code>{esc(r.entry.short())}</code> — <i>{esc(r.error)}</i>")
+    return "\n".join(lines)
+
+
+def country_counts(alive) -> List[tuple]:
+    counts: Dict[str, int] = {}
+    for r in alive:
+        counts[r.country_code or ""] = counts.get(r.country_code or "", 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def geo_page(results) -> str:
+    alive = [r for r in results if r.alive]
+    if not alive:
+        return f"🌍 <b>COUNTRIES</b>\n{RULE}\nNo alive proxies to map."
+    names = {}
+    for r in alive:
+        if r.country_code:
+            names[r.country_code] = r.country or r.country_code
+    rows = country_counts(alive)[:15]
+    top = rows[0][1] if rows else 1
+    lines = [f"🌍 <b>COUNTRIES</b> · {len(rows)} shown", RULE]
+    for cc, n in rows:
+        label = esc(names.get(cc, "Unknown"))[:18]
+        lines.append(
+            f"{checker.flag(cc)} <b>{label}</b>\n"
+            f"     <code>{bar(n / top * 100, 12)}</code> {num(n)}"
+        )
+    return "\n".join(lines)
+
+
+def speed_page(results) -> str:
+    alive = [r for r in results if r.alive and r.latency]
+    if not alive:
+        return f"⚡ <b>SPEED</b>\n{RULE}\nNo latency data available."
+    fast = [r for r in alive if r.latency < 500]
+    medium = [r for r in alive if 500 <= r.latency < 1500]
+    slow = [r for r in alive if r.latency >= 1500]
+    total = len(alive)
+    lines = [f"⚡ <b>SPEED BREAKDOWN</b> · {num(total)} alive", RULE]
+    for label, group in (("🟢 Fast  <500ms", fast), ("🟡 Medium 0.5-1.5s", medium), ("🔴 Slow  >1.5s", slow)):
+        pct = len(group) / total * 100
+        lines.append(f"{label}\n     <code>{bar(pct, 12)}</code> {num(len(group))} · {pct:.0f}%")
+    lines += ["", "<b>Fastest 5</b>"]
+    for r in sorted(alive, key=lambda x: x.latency)[:5]:
+        lines.append(
+            f"▸ <code>{esc(r.entry.short())}</code> — <b>{r.latency}ms</b> "
+            f"{checker.flag(r.country_code)}"
+        )
+    return "\n".join(lines)
+
+
+def kind_page(results) -> str:
+    alive = [r for r in results if r.alive]
+    if not alive:
+        return f"🧬 <b>TYPES</b>\n{RULE}\nNo alive proxies to classify."
+    kinds = _kind_counts(alive)
+    schemes: Dict[str, int] = {}
+    for r in alive:
+        schemes[r.entry.scheme] = schemes.get(r.entry.scheme, 0) + 1
+    total = len(alive)
+    lines = [f"🧬 <b>PROXY TYPES</b> · {num(total)} alive", RULE, "<b>Network</b>"]
+    for key in (KIND_RESIDENTIAL, KIND_DATACENTER, KIND_MOBILE, KIND_UNKNOWN):
+        n = kinds[key]
+        if not n:
+            continue
+        pct = n / total * 100
+        lines.append(
+            f"{checker.KIND_LABELS[key]}\n     <code>{bar(pct, 12)}</code> {num(n)} · {pct:.0f}%"
+        )
+    lines += ["", "<b>Protocol</b>"]
+    for scheme, n in sorted(schemes.items(), key=lambda kv: kv[1], reverse=True):
+        pct = n / total * 100
+        label = checker.SCHEME_LABELS.get(scheme, scheme.upper())
+        lines.append(f"▸ <b>{label}</b> · {num(n)} <code>{bar(pct, 8)}</code>")
+    return "\n".join(lines)
+
+
+def stats_text(row) -> str:
+    if not row:
+        return (
+            f"📈 <b>YOUR STATS</b>\n{RULE}\nNo scans yet — send a proxy list to get started."
+        )
+    _, username, total, alive, dead, batches, last_check, _ = row
+    pct = (alive / total * 100) if total else 0
+    return (
+        f"📈 <b>YOUR STATS</b> · @{esc(username or '—')}\n"
+        f"{RULE}\n"
+        f"▸ Scans run: <b>{num(batches)}</b>\n"
+        f"▸ Proxies tested: <b>{num(total)}</b>\n"
+        f"▸ Alive: <b>{num(alive)}</b> ({pct:.0f}%)\n"
+        f"<code>{bar(pct)}</code>\n"
+        f"▸ Dead: <b>{num(dead)}</b>\n"
+        f"▸ Last scan: <code>{esc(last_check)}</code>"
+    )
+
+
+# ── admin screens ─────────────────────────────────────────────────────────
+def admin_home_text(uptime: float, running: int, groups: int, today_total: int, day: str) -> str:
+    return (
+        "👑 <b>ADMIN CONTROL CENTRE</b>\n"
+        f"{RULE}\n"
+        f"▸ Uptime: <b>{human_time(uptime)}</b>\n"
+        f"▸ Active scans: <b>{running}</b>\n"
+        f"▸ Linked groups: <b>{groups}</b>\n"
+        f"▸ Collected today ({esc(day)}): <b>{num(today_total)}</b> alive\n\n"
+        "<i>Pick an action below.</i>"
+    )
+
+
+def admin_home_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 Global stats", callback_data="admin:stats"),
+                InlineKeyboardButton("👥 Users", callback_data="admin:users:0"),
+            ],
+            [
+                InlineKeyboardButton("📦 Today's proxies", callback_data="admin:today"),
+                InlineKeyboardButton("🗂 Archive", callback_data="admin:archive"),
+            ],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="admin:bc_prompt")],
+            [InlineKeyboardButton("❌ Close", callback_data="admin:close")],
+        ]
+    )
+
+
+def daily_report_caption(day: str, total: int, schemes: dict, kinds: dict, rotating: int) -> str:
+    def g(d, k):
+        return num(d.get(k, 0))
+
+    return (
+        "🌙 <b>DAILY PROXY DROP</b>\n"
+        f"{RULE}\n"
+        f"📅 <b>{esc(day)}</b>\n"
+        f"✅ Unique alive collected: <b>{num(total)}</b>\n"
+        f"🔄 Rotating: <b>{num(rotating)}</b>\n\n"
+        "<b>By protocol</b>\n"
+        f"▸ SOCKS5 <b>{g(schemes, 'socks5')}</b> · SOCKS4 <b>{g(schemes, 'socks4')}</b> · "
+        f"HTTP <b>{g(schemes, 'http')}</b>\n"
+        "<b>By network</b>\n"
+        f"▸ 🏠 Residential <b>{g(kinds, KIND_RESIDENTIAL)}</b> · "
+        f"🏢 Datacenter <b>{g(kinds, KIND_DATACENTER)}</b> · "
+        f"📶 Mobile <b>{g(kinds, KIND_MOBILE)}</b>\n\n"
+        "<i>Files attached below.</i>"
+    )
