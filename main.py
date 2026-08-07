@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
 
 import aiohttp
+from aiohttp import web
 import aiosqlite
 from aiohttp import ClientTimeout
 from aiohttp_socks import ProxyConnector
@@ -31,7 +32,7 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 # ── Telegram ──────────────────────────────────────────────────────────────
-BOT_TOKEN = "8871497353:AAF8EHmP7roz6Y0qJZE-JBH6x0fftPVWAhE"
+BOT_TOKEN = "8871497353:AAGgydLe71aNb07kuWZoOUaW0wbRrC2d9Ow"
 ADMIN_USER_ID = 5010778910
 GROUP_IDS = [-1004358364327]
 ALLOWED_USER_IDS = []
@@ -649,6 +650,10 @@ async def post_init(app: Application):
     # Launch the nightly digest scheduler.
     app.bot_data["digest_task"] = asyncio.create_task(nightly_digest_loop(app))
     log.info("Nightly digest scheduler started (%02d:%02d).", DIGEST_HOUR, DIGEST_MINUTE)
+
+    # Launch Render Web Server and Keep-Alive ping
+    app.bot_data["render_web_task"] = asyncio.create_task(start_render_web_server())
+    app.bot_data["render_ping_task"] = asyncio.create_task(render_keep_alive())
 
 # ─────────────────────────  USER COMMANDS  ─────────────────────────
 
@@ -1433,6 +1438,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_admin_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_USER_ID and context.user_data.get("admin_state") == "awaiting_broadcast":
         await handle_broadcast_receive(update, context)
+
+async def start_render_web_server():
+    async def handle(request):
+        return web.Response(text="Bot is running!")
+    
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    log.info(f"Render Web Server started on port {port}")
+
+async def render_keep_alive():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        log.warning("RENDER_EXTERNAL_URL not set in environment. Self-ping disabled.")
+        return
+        
+    while True:
+        await asyncio.sleep(9 * 60) # Ping every 9 minutes (Render sleeps after 15)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    log.info(f"Self-ping status: {response.status}")
+        except Exception as e:
+            log.error(f"Self-ping failed: {e}")
 
 def main():
     app = (
